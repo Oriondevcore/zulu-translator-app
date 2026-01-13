@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Zulu Pro Translator</title>
+    
+    <!-- PWA Meta -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#2563eb">
+    
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
+        .recording-pulse { animation: recording 1.5s infinite; }
+        @keyframes recording {
+            0% { box-shadow: 0 0 0 0px rgba(239, 68, 68, 0.4); }
+            100% { box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); }
+        }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+    </style>
+</head>
+<body class="bg-slate-50 overflow-hidden">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const App = () => {
+            // --- Configuration State ---
+            const [keys, setKeys] = useState({
+                gemini: localStorage.getItem('z_gemini') || '',
+                github: localStorage.getItem('z_github') || ''
+            });
+            const [showSettings, setShowSettings] = useState(!keys.gemini || !keys.github);
+            
+            // --- App State ---
+            const [isListening, setIsListening] = useState(false);
+            const [transcript, setTranscript] = useState('');
+            const [translation, setTranslation] = useState('');
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [zuluToEnglish, setZuluToEnglish] = useState(true);
+            const [status, setStatus] = useState('');
+
+            // --- Refs ---
+            const recognitionRef = useRef(null);
+            const debounceTimer = useRef(null);
+            const audioRef = useRef(null);
+            const audioContextUnlocked = useRef(false);
+
+            // --- Initialization ---
+            useEffect(() => {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRecognition) {
+                    recognitionRef.current = new SpeechRecognition();
+                    recognitionRef.current.continuous = true;
+                    recognitionRef.current.interimResults = true;
+                    
+                    recognitionRef.current.onresult = (event) => {
+                        let text = '';
+                        for (let i = event.resultIndex; i < event.results.length; i++) {
+                            text += event.results[i][0].transcript;
+                        }
+                        setTranscript(text);
+                        
+                        // Auto-translate after 1.4s of silence
+                        if (debounceTimer.current) clearTimeout(debounceTimer.current);
+                        debounceTimer.current = setTimeout(() => {
+                            if (text.trim()) translateText(text);
+                        }, 1400);
+                    };
+                }
+            }, [zuluToEnglish]);
+
+            // --- Core Logic: Translate ---
+            const translateText = async (text) => {
+                if (!keys.gemini || isProcessing) return;
+                setIsProcessing(true);
+                setStatus('Translating...');
+
+                try {
+                    const prompt = `Translate this from ${zuluToEnglish ? 'Zulu to English' : 'English to Zulu'}. Return only the translated text.\n\nText: ${text}`;
+                    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${keys.gemini}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+                    });
+                    const data = await res.json();
+                    const result = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                    if (result) {
+                        setTranslation(result);
+                        playVoice(result);
+                        setStatus('');
+                    }
+                } catch (err) {
+                    setStatus('Translation failed');
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            // --- Core Logic: Text to Speech ---
+            const playVoice = async (text) => {
+                try {
+                    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${keys.gemini}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            contents: [{ parts: [{ text: `Say in a natural ${zuluToEnglish ? 'English' : 'Zulu'} voice: ${text}` }] }],
+                            generationConfig: { 
+                                responseModalities: ["AUDIO"],
+                                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } }
+                            }
+                        })
+                    });
+                    const data = await res.json();
+                    const b64 = data.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+                    
+                    if (b64) {
+                        const audio = new Audio(`data:audio/wav;base64,${b64}`);
+                        audio.play().catch(e => console.log("Audio block", e));
+                    }
+                } catch (e) { console.error(e); }
+            };
+
+            // --- GitHub Deployment ---
+            const deploy = async () => {
+                if (!keys.github) return alert("Please enter GitHub PAT");
+                setStatus('Deploying to GitHub...');
+                
+                try {
+                    const headers = { 'Authorization': `token ${keys.github}`, 'Accept': 'application/vnd.github.v3+json' };
+                    const userRes = await fetch('https://api.github.com/user', { headers });
+                    const user = await userRes.json();
+                    
+                    const repoName = "zulu-translator-app";
+                    
+                    // Create Repo
+                    await fetch('https://api.github.com/user/repos', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ name: repoName, auto_init: true })
+                    });
+
+                    // Wait for init
+                    await new Promise(r => setTimeout(r, 2500));
+
+                    const htmlContent = document.documentElement.outerHTML;
+                    const b64Content = btoa(unescape(encodeURIComponent(htmlContent)));
+
+                    // Get SHA if exists
+                    const fileCheck = await fetch(`https://api.github.com/repos/${user.login}/${repoName}/contents/index.html`, { headers });
+                    const fileData = await fileCheck.json();
+                    const sha = fileData.sha || null;
+
+                    // Push file
+                    await fetch(`https://api.github.com/repos/${user.login}/${repoName}/contents/index.html`, {
+                        method: 'PUT',
+                        headers,
+                        body: JSON.stringify({ message: "Update Translator", content: b64Content, sha })
+                    });
+
+                    // Enable Pages
+                    await fetch(`https://api.github.com/repos/${user.login}/${repoName}/pages`, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ source: { branch: 'main', path: '/' } })
+                    });
+
+                    setStatus(`Live: https://${user.login}.github.io/${repoName}`);
+                } catch (err) {
+                    setStatus('Deployment error');
+                    console.error(err);
+                }
+            };
+
+            const toggleMic = () => {
+                // Unlock audio for browser
+                const silent = new Audio("data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==");
+                silent.play();
+
+                if (isListening) {
+                    recognitionRef.current.stop();
+                    setIsListening(false);
+                } else {
+                    setTranscript('');
+                    setTranslation('');
+                    recognitionRef.current.lang = zuluToEnglish ? 'zu-ZA' : 'en-US';
+                    recognitionRef.current.start();
+                    setIsListening(true);
+                }
+            };
+
+            const updateKey = (type, val) => {
+                localStorage.setItem(`z_${type}`, val);
+                setKeys(prev => ({ ...prev, [type]: val }));
+            };
+
+            return (
+                <div className="h-screen flex flex-col bg-slate-50 max-w-lg mx-auto overflow-hidden">
+                    
+                    {/* Settings Layer */}
+                    {showSettings && (
+                        <div className="fixed inset-0 bg-slate-900/95 backdrop-blur-xl z-50 flex items-center justify-center p-6 text-white">
+                            <div className="w-full space-y-8 animate-in zoom-in duration-300">
+                                <div className="text-center">
+                                    <h2 className="text-4xl font-extrabold tracking-tighter mb-2">DEV SETUP</h2>
+                                    <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Connect your services</p>
+                                </div>
+                                
+                                <div className="space-y-4">
+                                    <div className="space-y-1">
+                                        <label className="text-[10px] font-bold text-slate-500 uppercase ml-1">Gemini API Key</label>
+                                        <input type="password" value={keys.gemini} onChange={e => updateKey('gemini', e.target.value)} className="w-full p-4 bg-white/5 border border-white/10 rounded-2xl outline-none focus:border-blue-500 transition-all" placeholder="Enter key..." />
+                                    </div>
+                                    <div className="space-y-1">
+                                        <label className="text-[10px] font-bold text-slate-500 uppercase ml-1">GitHub PAT (Token)</label>
+                                        <input type="password" value={keys.github} onChange={e => updateKey('github', e.target.value)} className="w-full p-4 bg-white/5 border border-white/10 rounded-2xl outline-none focus:border-blue-500 transition-all" placeholder="Enter ghp_..." />
+                                    </div>
+                                </div>
+
+                                <div className="pt-4 space-y-3">
+                                    <button onClick={deploy} className="w-full py-4 bg-white text-black font-black rounded-2xl flex items-center justify-center gap-2 active:scale-95 transition-all">
+                                        PUSH TO GITHUB
+                                    </button>
+                                    <button onClick={() => setShowSettings(false)} className="w-full py-4 text-slate-400 font-bold">CLOSE</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Header */}
+                    <header className="p-6 bg-white border-b border-slate-100 flex justify-between items-center shadow-sm z-10">
+                        <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center shadow-lg"><span className="text-white font-black">Z</span></div>
+                            <div>
+                                <h1 className="text-xl font-black tracking-tighter leading-none uppercase">Zulu Live</h1>
+                                <p className="text-[8px] font-bold text-slate-400 uppercase tracking-widest mt-1">Version 3.0 Dev</p>
+                            </div>
+                        </div>
+                        <button onClick={() => setShowSettings(true)} className="p-3 text-slate-400 hover:text-blue-600 transition-all">⚙️</button>
+                    </header>
+
+                    {/* Content */}
+                    <div className="flex-1 flex flex-col p-4 gap-4 overflow-hidden">
+                        {/* Top Card: Source */}
+                        <div className="flex-1 bg-white rounded-[3rem] border border-slate-100 p-10 flex flex-col items-center justify-center relative shadow-sm overflow-hidden">
+                            <span className="absolute top-8 left-10 text-[10px] font-bold text-slate-300 uppercase tracking-widest">
+                                {zuluToEnglish ? 'Input: Zulu' : 'Input: English'}
+                            </span>
+                            <p className={`text-4xl md:text-5xl text-center font-bold leading-tight ${!transcript ? 'text-slate-100' : 'text-slate-800'}`}>
+                                {transcript || "Tap Mic"}
+                            </p>
+                            {status && <p className="absolute bottom-8 text-[10px] font-bold text-blue-500 uppercase tracking-widest animate-pulse">{status}</p>}
+                        </div>
+
+                        {/* Controls Hub */}
+                        <div className="flex justify-center items-center gap-8 -my-10 z-20">
+                            <button onClick={() => { setZuluToEnglish(!zuluToEnglish); setTranscript(''); setTranslation(''); }} className="w-16 h-16 bg-white shadow-xl rounded-2xl flex items-center justify-center text-xl text-blue-600 active:rotate-180 transition-all duration-500">⇄</button>
+                            <button onClick={toggleMic} className={`w-28 h-28 rounded-[2.5rem] shadow-2xl flex items-center justify-center text-5xl transition-all active:scale-90 ${isListening ? 'bg-red-500 recording-pulse' : 'bg-blue-600 ring-8 ring-blue-50'}`}>
+                                {isListening ? '🛑' : '🎤'}
+                            </button>
+                            <button onClick={() => { setTranscript(''); setTranslation(''); }} className="w-16 h-16 bg-white shadow-xl rounded-2xl flex items-center justify-center text-slate-300">🗑️</button>
+                        </div>
+
+                        {/* Bottom Card: Translation */}
+                        <div className="flex-1 bg-blue-600 rounded-[3rem] shadow-2xl p-10 flex flex-col items-center justify-center relative text-white overflow-hidden">
+                            <span className="absolute top-8 left-10 text-[10px] font-bold text-blue-300 uppercase tracking-widest">
+                                {zuluToEnglish ? 'Output: English' : 'Output: Zulu'}
+                            </span>
+                            <p className="text-5xl md:text-6xl text-center font-black leading-none tracking-tighter">
+                                {translation || "..."}
+                            </p>
+                            {translation && <button onClick={() => playVoice(translation)} className="absolute bottom-8 right-10 w-12 h-12 bg-white/10 rounded-full flex items-center justify-center">🔊</button>}
+                        </div>
+                    </div>
+
+                    <footer className="p-6 text-center text-[10px] font-bold text-slate-300 uppercase tracking-[0.4em]">
+                        Built with Gemini 2.5 Flash
+                    </footer>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
