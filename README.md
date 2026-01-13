@@ -1,0 +1,1 @@
+# zulu-translator-app
